@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="vi">
+<meta charset="utf-8">
+<title>Fishing Timing Lab</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% 110%,#206b72,#132b40 62%,#0b182c);color:#ebf9ff;font:15px system-ui;display:grid;place-items:center}.controls{position:absolute;top:28px;left:32px}h1{margin:0 0 16px;font-size:28px}button,select{padding:8px 12px;border:1px solid #89b9c4;border-radius:7px;background:#102b40;color:white;font:inherit}button{cursor:pointer}label{margin-right:12px}.dock{position:absolute;bottom:11%;width:min(460px,94vw);padding:14px 17px;background:#f9fcfc;color:#142130;border-radius:14px}header{display:flex;justify-content:space-between;font-weight:800}#badge{background:#216abe;color:white;border-radius:99px;padding:3px 9px;font-size:10px;letter-spacing:.1em}.layout{display:grid;grid-template-columns:1fr 15px;gap:22px;margin-top:12px}#track{height:34px;position:relative;overflow:hidden;border-radius:10px;background:linear-gradient(#4d17cc,#340bb2 55%,#2c008b)}#track.hit{box-shadow:0 0 0 3px #36dddd}#track.miss{box-shadow:0 0 0 3px #fa486c}.zone{position:absolute;top:5px;bottom:5px;border:1px solid #a8e2ff;border-radius:5px;background:linear-gradient(#71ccff,#2785e2)}#needle{position:absolute;top:0;bottom:0;width:6px;background:#fafafa;box-shadow:0 0 0 1px #171333}#meter{border:2px solid #232b35;border-radius:10px;position:relative;overflow:hidden}#fill{position:absolute;inset:auto 0 0;background:#e63a52}.dots{text-align:center;color:#356eb5;margin:4px 0;letter-spacing:4px}.hint{font-size:12px;text-align:center;margin:4px 0;color:#495c64}kbd{padding:2px 5px;background:#e5ecef;border-radius:4px}#status{margin-top:12px;display:block}
+</style>
+<main class="controls">
+<h1>Fishing Timing Lab</h1>
+<label>Độ khó <select id="difficulty"><option>Common</option><option selected>Rare</option><option>Legendary</option></select></label>
+<button id="start">Thả câu</button>
+<label><input id="repeat" type="checkbox"> Tự mở vòng tiếp</label>
+<output id="status" aria-live="polite"></output>
+</main>
+<section id="panel" class="dock" hidden>
+<header><span>Cá cắn câu!</span><span id="badge"></span></header>
+<div class="layout"><div><div id="track"><div id="needle"></div></div><div id="dots" class="dots"></div><p class="hint">Bấm <kbd>Space</kbd> khi vạch nằm trong ô xanh. Bấm hụt mất thời gian.</p></div><div id="meter"><div id="fill"></div></div></div>
+</section>
+<script>
+const $ = id => document.getElementById(id);
+const track = $('track'), needle = $('needle');
+const rules = {Common:[2,.15,.95,8], Rare:[3,.117,1.60,7], Legendary:[5,.095,2.20,7]};
+let round, flashUntil = 0, wins = 0, losses = 0, timer;
+function start() {
+  clearTimeout(timer);
+  const difficulty = $('difficulty').value;
+  const [count,width,speed,seconds] = rules[difficulty];
+  const zones = Array.from({length:count}, (_,i) => {
+    const center = (i+.5)/count + (Math.random()-.5)*.22/count;
+    const el = document.createElement('div');
+    el.className = 'zone';
+    el.style.left = (center-width/2)*100+'%';
+    el.style.width = width*100+'%';
+    return {center,width,el,hit:false};
+  });
+  track.replaceChildren(...zones.map(z=>z.el),needle);
+  round = {zones,speed,seconds,started:performance.now(),penalty:0,misses:0,x:0};
+  track.className = '';
+  $('badge').textContent = difficulty.toUpperCase();
+  $('dots').textContent = '○'.repeat(count);
+  $('panel').hidden = false;
+  $('status').textContent = 'Đang câu · ' + wins + ' thắng / ' + losses + ' thua';
+  $('start').blur();
+}
+function finish(won) {
+  if (won) wins++; else losses++;
+  $('status').textContent = (won?'Đã câu được':'Cá thoát') + ' · ' + round.misses + ' hụt · Tổng ' + wins + ' thắng / ' + losses + ' thua';
+  round = null;
+  $('panel').hidden = true;
+  if ($('repeat').checked) timer = setTimeout(()=>{if($('repeat').checked) start()},1100);
+}
+window.addEventListener('keydown',event=>{
+  if(event.code!=='Space'||!round) return;
+  event.preventDefault();
+  if(event.repeat) return;
+  const zone = round.zones.find(z=>!z.hit && Math.abs(z.center-round.x)<=z.width/2);
+  if(zone) {
+    zone.hit = true;
+    zone.el.remove();
+    if(round.zones.every(z=>z.hit)) {finish(true);return}
+    $('dots').textContent = round.zones.map(z=>z.hit?'●':'○').join('');
+  } else {
+    round.misses++;
+    round.penalty += 1.05;
+  }
+  track.className = zone?'hit':'miss';
+  flashUntil = performance.now()+155;
+});
+function frame(now) {
+  if(round) {
+    const elapsed = Math.max(0,(now-round.started)/1000);
+    const remaining = round.seconds-elapsed-round.penalty;
+    if(remaining<=0) finish(false);
+    else {
+      round.x = 1-Math.abs(1-(elapsed*round.speed)%2);
+      needle.style.left = 'calc('+round.x*100+'% - 3px)';
+      $('fill').style.height = 100*remaining/round.seconds+'%';
+      if(now>=flashUntil) track.className = '';
+    }
+  }
+  requestAnimationFrame(frame);
+}
+$('start').onclick = start;
+requestAnimationFrame(frame);
+// Open repeated rounds for local integration testing.
+if(new URLSearchParams(location.search).has('test')) {
+  $('repeat').checked = true;
+  $('difficulty').value = new URLSearchParams(location.search).get('test') || 'Rare';
+  setTimeout(start,2500);
+}
+</script>
+</html>
