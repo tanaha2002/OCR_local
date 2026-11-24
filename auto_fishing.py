@@ -14,6 +14,7 @@ from datetime import datetime
 from zipfile import ZIP_DEFLATED, ZipFile
 from pathlib import Path
 from ctypes import wintypes as w
+from statistics import median
 import sys
 import threading
 import time
@@ -229,10 +230,30 @@ class FishingTrace:
         return path
 
 
+def strike_window(x, velocity, grab_ms, lead, zones):
+    # The capture may represent an earlier display frame. Require the
+    # marker to fit in the target across a range of plausible input times.
+    if grab_ms >= 35:
+        predicted = x + velocity * lead
+        for a, b in zones:
+            margin = max(2, (b-a)*.20)
+            if a+1 <= x <= b-1 and a+margin <= predicted <= b-margin:
+                return (a,b), predicted
+        return None, predicted
+    near = x + velocity * lead
+    far = x + velocity * (lead + min(0.012, grab_ms * .00055))
+    for a, b in zones:
+        margin = max(2, (b-a)*.13)
+        if a+margin <= min(near, far) and max(near, far) <= b-margin:
+            return (a, b), (near+far)/2
+    return None, (near+far)/2
+
+
 def capture_steps(roi, lead, stop, report, debug=False):
     trace = FishingTrace(roi, lead) if debug else None
     capture = None
     rail = previous = pending = None
+    velocities = []
     observed = last_marker = last_press = 0
     presses = 0
     status_time = 0
@@ -266,6 +287,7 @@ def capture_steps(roi, lead, stop, report, debug=False):
                               previous, pending, predicted, decision, presses)
                 if now-last_marker > .10:
                     rail = previous = pending = None
+                    velocities.clear()
                 yield 6
                 continue
             x,zones = result
@@ -281,24 +303,25 @@ def capture_steps(roi, lead, stop, report, debug=False):
             if previous and x != previous[0]:
                 old_x, old_t = previous
                 dt = now-old_t
-                if not .003 <= dt <= .12:
+                max_interval = .12 if grab_ms >= 35 else .055
+                if not .003 <= dt <= max_interval:
+                    velocities.clear()
                     decision = 'invalid_marker_interval'
-                elif pending:
-                    decision = 'waiting_for_hit_confirmation'
-                elif now-last_press <= .065:
-                    decision = 'cooldown'
                 else:
-                    decision = 'outside_safe_window' if zones else 'no_targets'
-                    delta = x-old_x
-                    span = rail[1]-rail[0]
-                    # Cap extrapolation to one plausible display step.
-                    predicted = x + max(-span*.06,min(span*.06,delta/dt*lead))
-                    for a,b in zones:
-                        margin = max(2,(b-a)*.20)
-                        if a+1 <= x <= b-1 and a+margin <= predicted <= b-margin:
-                            if stop.is_set():
-                                return
-                            decision = 'space_requested'
+                    speed = (x-old_x)/dt
+                    velocities = [(t,v) for t,v in velocities if now-t <= .11 and v*speed > 0]
+                    velocities.append((now,speed))
+                    if pending:
+                        decision = 'waiting_for_hit_confirmation'
+                    elif now-last_press <= .065:
+                        decision = 'cooldown'
+                    elif len(velocities) < 2 and grab_ms < 35:
+                        decision = 'waiting_for_stable_direction'
+                    else:
+                        velocity = speed if grab_ms >= 35 else median(v for _,v in velocities)
+                        target, predicted = strike_window(x, velocity, grab_ms, lead, zones)
+                        decision = 'outside_safe_window' if zones else 'no_targets'
+                        if target and not stop.is_set():
                             try:
                                 capture.strike()
                             except Exception:
@@ -306,12 +329,12 @@ def capture_steps(roi, lead, stop, report, debug=False):
                                     trace.add(now, grab_ms, pixels, width, height, rail, result,
                                               previous, pending, predicted, 'space_error', presses)
                                 raise
+                            a,b = target
                             decision = 'space_sent'
                             last_press = now
                             pending = ((a+b)/2,now,len(zones))
                             presses += 1
                             report(f'Space: {presses}')
-                            break
             if trace:
                 trace.add(now, grab_ms, pixels, width, height, rail, result,
                           previous, pending, predicted, decision, presses)
