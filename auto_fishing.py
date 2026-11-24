@@ -9,6 +9,7 @@ import queue
 import json
 import platform
 import traceback
+import zlib
 from datetime import datetime
 from zipfile import ZIP_DEFLATED, ZipFile
 from pathlib import Path
@@ -80,7 +81,11 @@ def read_track(data, width, height, rail):
     span = right-left
     if violet < span * .34:
         return None
-    markers = [(a,b) for a,b in runs(white) if 1 <= b-a <= max(4,span*.04)]
+    # Rounded rail corners expose the white panel. The moving needle can
+    # be ignored near either end, where there are no safe strikes.
+    edge = max(bottom - top, span * .035) // 2
+    markers = [(a,b) for a,b in runs(white)
+               if edge <= a < b <= span-edge and 1 <= b-a <= max(4,span*.04)]
     if len(markers) != 1:
         return None
     a,b = markers[0]
@@ -198,13 +203,14 @@ class FishingTrace:
             'space_count': presses,
         }
         index = len(self.rows)
-        if ((elapsed - self.last_image >= .030 or decision == 'space_sent')
-                and self.image_bytes + len(pixels) <= 64 * 1024**2):
-            name = f'frames/{index:05d}.bgra'
-            row['image'] = name
-            self.images.append((name, pixels))
-            self.image_bytes += len(pixels)
-            self.last_image = elapsed
+        if (elapsed - self.last_image >= .030 or decision == 'space_sent') and self.image_bytes < 64 * 1024**2:
+            packed = zlib.compress(pixels, level=1)
+            if self.image_bytes + len(packed) <= 64 * 1024**2:
+                name = f'frames/{index:05d}.bgra'
+                row['image'] = name
+                self.images.append((name, packed))
+                self.image_bytes += len(packed)
+                self.last_image = elapsed
         self.rows.append(row)
 
     def save(self):
@@ -218,7 +224,7 @@ class FishingTrace:
             bundle.writestr('metadata.json', json.dumps(meta, indent=2))
             bundle.writestr('trace.jsonl', '\n'.join(json.dumps(row) for row in self.rows))
             for name, data in self.images:
-                bundle.writestr(name, data)
+                bundle.writestr(name, zlib.decompress(data))
         print(f'Debug: {path.resolve()}', flush=True)
         return path
 
