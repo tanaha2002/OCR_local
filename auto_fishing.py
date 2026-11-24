@@ -6,6 +6,12 @@ import argparse
 import ctypes as c
 import faulthandler
 import queue
+import json
+import platform
+import traceback
+from datetime import datetime
+from zipfile import ZIP_DEFLATED, ZipFile
+from pathlib import Path
 from ctypes import wintypes as w
 import sys
 import threading
@@ -33,18 +39,18 @@ def locate(data, width, height):
     # The rail is visible above and below the inset targets. Find a wide,
     # nearly solid purple row, bridging the white moving marker.
     best = None
-    for y in range(2, height - 5):
+    for y in range(height):
         row = data[y * width * 4:(y + 1) * width * 4]
         mask = [purple(*row[i:i+3]) for i in range(0, len(row), 4)]
         merged = []
         for left, right in runs(mask):
-            if merged and left - merged[-1][1] <= max(8, width * .055):
+            if merged and left - merged[-1][1] <= max(8, min(24, width * .055)):
                 merged[-1] = merged[-1][0], right
             else:
                 merged.append((left, right))
         for left, right in merged:
             span = right - left
-            if span >= max(85, width * .46) and (best is None or span > best[0]):
+            if span >= 74 and (best is None or span > best[0]):
                 sample = range(left + span//10, right - span//10, max(1,span//36))
                 def rail_row(row):
                     offset = row * width * 4
@@ -55,7 +61,7 @@ def locate(data, width, height):
                     top -= 1
                 while bottom < height and rail_row(bottom):
                     bottom += 1
-                if 12 <= bottom-top <= min(105,span*.29):
+                if 9 <= bottom-top <= min(105,span*.29):
                     best = span,(left,right,top,bottom)
     return best[1] if best else None
 
@@ -63,14 +69,14 @@ def locate(data, width, height):
 def read_track(data, width, height, rail):
     left, right, top, bottom = rail
     mid = (top + bottom) // 2
-    y_values = [top + (bottom-top)//5, mid, bottom - (bottom-top)//5 - 1]
+    y_values = [top + (bottom-top)*part//6 for part in (1, 2, 3, 4, 5)]
     white, blue, violet = [], [], 0
     for x in range(left, right):
         pixels = [data[(y*width+x)*4:(y*width+x)*4+3] for y in y_values]
-        white.append(all(min(p) > 205 and max(p)-min(p) < 45 for p in pixels))
-        b, g, r = pixels[1]
+        white.append(sum(min(p) > 192 and max(p)-min(p) < 52 for p in pixels) >= 4)
+        b, g, r = pixels[2]
         blue.append(b > 145 and g > 106 and b > g + 14 and g > r + 30)
-        violet += purple(*pixels[1])
+        violet += purple(*pixels[2])
     span = right-left
     if violet < span * .34:
         return None
@@ -86,7 +92,7 @@ def read_track(data, width, height, rail):
             zones[-1] = zones[-1][0], end
         else:
             zones.append((start,end))
-    return x, [(left+a,left+b) for a,b in zones if span*.035 <= b-a <= span*.24]
+    return x, [(left+a,left+b) for a,b in zones if span*.025 <= b-a <= span*.24]
 
 
 class WindowsCapture:
@@ -159,20 +165,99 @@ class MacCapture:
         self.screen.close()
 
 
-def capture_steps(roi, lead, stop, report):
-    capture = (WindowsCapture if sys.platform == 'win32' else MacCapture)(roi)
+class FishingTrace:
+    """Record only the selected pixels and decisions while the bot runs."""
+
+    def __init__(self, roi, lead):
+        self.roi = roi
+        self.lead = lead
+        self.started = time.perf_counter()
+        self.rows = []
+        self.images = []
+        self.image_bytes = 0
+        self.last_image = -1.0
+        self.error = None
+
+    def add(self, now, grab_ms, pixels, width, height, rail, result,
+            previous, pending, predicted, decision, presses):
+        elapsed = now - self.started
+        if elapsed > 30:
+            return
+        row = {
+            't_ms': round(elapsed * 1000, 2),
+            'grab_ms': round(grab_ms, 2),
+            'pixel_size': [width, height],
+            'rail': rail,
+            'marker_x': result[0] if result else None,
+            'zones': result[1] if result else [],
+            'previous_x': previous[0] if previous else None,
+            'marker_dt_ms': round((now - previous[1]) * 1000, 2) if previous else None,
+            'predicted_x': predicted,
+            'pending_target': pending[0] if pending else None,
+            'decision': decision,
+            'space_count': presses,
+        }
+        index = len(self.rows)
+        if ((elapsed - self.last_image >= .030 or decision == 'space_sent')
+                and self.image_bytes + len(pixels) <= 64 * 1024**2):
+            name = f'frames/{index:05d}.bgra'
+            row['image'] = name
+            self.images.append((name, pixels))
+            self.image_bytes += len(pixels)
+            self.last_image = elapsed
+        self.rows.append(row)
+
+    def save(self):
+        path = Path(f'fishing-debug-{datetime.now():%Y%m%d-%H%M%S-%f}.zip')
+        meta = {'roi': self.roi, 'lead_ms': self.lead * 1000,
+                'platform': platform.platform(), 'python': platform.python_version(),
+                'pixel_format': 'BGRA, 4 bytes/pixel, top-down, tightly packed',
+                'error': self.error, 'frames': len(self.rows),
+                'saved_images': len(self.images), 'max_duration_seconds': 30}
+        with ZipFile(path, 'x', compression=ZIP_DEFLATED, compresslevel=1) as bundle:
+            bundle.writestr('metadata.json', json.dumps(meta, indent=2))
+            bundle.writestr('trace.jsonl', '\n'.join(json.dumps(row) for row in self.rows))
+            for name, data in self.images:
+                bundle.writestr(name, data)
+        print(f'Debug: {path.resolve()}', flush=True)
+        return path
+
+
+def capture_steps(roi, lead, stop, report, debug=False):
+    trace = FishingTrace(roi, lead) if debug else None
+    capture = None
     rail = previous = pending = None
     observed = last_marker = last_press = 0
     presses = 0
+    status_time = 0
     try:
+        capture = (WindowsCapture if sys.platform == 'win32' else MacCapture)(roi)
         while not stop.is_set():
+            before_grab = time.perf_counter()
             pixels,width,height = capture.grab()
             now = time.perf_counter()
+            grab_ms = (now-before_grab)*1000
+            predicted = None
+            decision = 'marker_stationary'
             if rail is None and now-observed >= .055:
                 observed = now
                 rail = locate(pixels,width,height)
             result = read_track(pixels,width,height,rail) if rail else None
+            if now - status_time >= .55:
+                status_time = now
+                if rail is None:
+                    phase = 'Chưa thấy thanh tím'
+                elif result is None:
+                    phase = 'Thấy thanh, chưa thấy vạch trắng'
+                else:
+                    phase = f'Thấy vạch | Ô xanh: {len(result[1])}'
+                message = f'{phase} | Space: {presses}'
+                report(message)
             if result is None:
+                if trace:
+                    decision = 'no_marker' if rail else 'no_rail'
+                    trace.add(now, grab_ms, pixels, width, height, rail, result,
+                              previous, pending, predicted, decision, presses)
                 if now-last_marker > .10:
                     rail = previous = pending = None
                 yield 6
@@ -185,10 +270,19 @@ def capture_steps(roi, lead, stop, report):
                     pending = None
                 elif now-sent > .2 and abs(center-x) > (rail[1]-rail[0])*.10:
                     pending = None
+            if not zones:
+                decision = 'no_targets'
             if previous and x != previous[0]:
                 old_x, old_t = previous
                 dt = now-old_t
-                if .003 <= dt <= .12 and not pending and now-last_press > .065:
+                if not .003 <= dt <= .12:
+                    decision = 'invalid_marker_interval'
+                elif pending:
+                    decision = 'waiting_for_hit_confirmation'
+                elif now-last_press <= .065:
+                    decision = 'cooldown'
+                else:
+                    decision = 'outside_safe_window' if zones else 'no_targets'
                     delta = x-old_x
                     span = rail[1]-rail[0]
                     # Cap extrapolation to one plausible display step.
@@ -198,21 +292,39 @@ def capture_steps(roi, lead, stop, report):
                         if a+1 <= x <= b-1 and a+margin <= predicted <= b-margin:
                             if stop.is_set():
                                 return
-                            capture.strike()
+                            decision = 'space_requested'
+                            try:
+                                capture.strike()
+                            except Exception:
+                                if trace:
+                                    trace.add(now, grab_ms, pixels, width, height, rail, result,
+                                              previous, pending, predicted, 'space_error', presses)
+                                raise
+                            decision = 'space_sent'
                             last_press = now
                             pending = ((a+b)/2,now,len(zones))
                             presses += 1
                             report(f'Space: {presses}')
                             break
+            if trace:
+                trace.add(now, grab_ms, pixels, width, height, rail, result,
+                          previous, pending, predicted, decision, presses)
             if not previous or x != previous[0] or now-previous[1] > .05:
                 previous = x,now
             yield 4
+    except Exception:
+        if trace:
+            trace.error = traceback.format_exc()
+        raise
     finally:
-        capture.close()
+        if capture:
+            capture.close()
+        if trace:
+            trace.save()
 
 
-def work(roi, lead, stop, report):
-    steps = capture_steps(roi, lead, stop, report)
+def work(roi, lead, stop, report, debug=False):
+    steps = capture_steps(roi, lead, stop, report, debug)
     try:
         for delay_ms in steps:
             if stop.wait(delay_ms / 1000):
@@ -221,7 +333,7 @@ def work(roi, lead, stop, report):
         steps.close()
 
 
-def gui(lead):
+def gui(lead, debug=False):
     root = tk.Tk()
     root.title('Auto Fishing')
     root.attributes('-topmost',True)
@@ -264,7 +376,7 @@ def gui(lead):
         cancel = stop
         status.set('Chuyển focus về game trong 2 giây')
         if on_mac:
-            mac_steps = capture_steps(roi, lead, cancel, status.set)
+            mac_steps = capture_steps(roi, lead, cancel, status.set, debug)
             scheduled = root.after(2000, mac_tick)
             return
 
@@ -275,7 +387,7 @@ def gui(lead):
             if cancel.wait(2):
                 return
             try:
-                work(roi, lead, cancel, report)
+                work(roi, lead, cancel, report, debug)
             except Exception as error:
                 report(str(error))
 
@@ -357,15 +469,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--lead-ms',type=float,default=8)
     parser.add_argument('--roi',type=int,nargs=4,metavar=('X','Y','W','H'))
+    parser.add_argument('--debug', action='store_true', help='Save a ZIP of selected-region pixels, recognition and Space events when stopped')
     args = parser.parse_args()
     if not 0 <= args.lead_ms <= 40:
         parser.error('--lead-ms must be 0–40')
     if args.roi:
         if args.roi[2] < 100 or args.roi[3] < 24:
             parser.error('ROI must be at least 100×24')
-        work(args.roi,args.lead_ms/1000,threading.Event(),lambda s: print(s,flush=True))
+        work(args.roi,args.lead_ms/1000,threading.Event(),lambda s: print(s,flush=True),args.debug)
     else:
-        gui(args.lead_ms/1000)
+        gui(args.lead_ms/1000,args.debug)
 
 
 if __name__ == '__main__':
